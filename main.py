@@ -7,45 +7,47 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from statistics import mean
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
 import websockets
 
-# =========================
-# 기본 설정
-# =========================
+# =========================================================
+# 실전 설정
+# BUY1: 완성된 15분봉 종가가 이전 20봉 최고가 돌파
+# BUY2+: 직전 BUY 가격에서 0.5 ATR씩 상승
+# 리셋: 완성된 15분봉 종가가 이전 10봉 최저가 이탈
+# 텔레그램: 15분봉 마감 후 BUY 신호만 한 번에 묶어서 전송
+# =========================================================
+
 UPBIT_REST = "https://api.upbit.com/v1"
 UPBIT_WS = "wss://api.upbit.com/websocket/v1"
 KST = ZoneInfo("Asia/Seoul")
 
 CANDLE_MINUTES = int(os.getenv("CANDLE_MINUTES", "15"))
 BREAKOUT_LENGTH = int(os.getenv("BREAKOUT_LENGTH", "20"))
-BUY_VOLUME_RATIO = float(os.getenv("BUY_VOLUME_RATIO", "1.5"))
-READY_DISTANCE = float(os.getenv("READY_DISTANCE", "0.01"))      # 1%
-READY_VOLUME_RATIO = float(os.getenv("READY_VOLUME_RATIO", "1.2"))
+EXIT_LENGTH = int(os.getenv("EXIT_LENGTH", "10"))
+ATR_LENGTH = int(os.getenv("ATR_LENGTH", "20"))
+ADD_ATR_MULTIPLIER = float(os.getenv("ADD_ATR_MULTIPLIER", "0.5"))
+HISTORY_COUNT = int(os.getenv("HISTORY_COUNT", "200"))
 REST_DELAY_SECONDS = float(os.getenv("REST_DELAY_SECONDS", "0.12"))
+CLOSE_WAIT_SECONDS = int(os.getenv("CLOSE_WAIT_SECONDS", "12"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 SUPPORTED_MINUTES = {1, 3, 5, 10, 15, 30, 60, 240}
 if CANDLE_MINUTES not in SUPPORTED_MINUTES:
-    raise ValueError(
-        f"CANDLE_MINUTES는 {sorted(SUPPORTED_MINUTES)} 중 하나여야 합니다."
-    )
+    raise ValueError(f"CANDLE_MINUTES는 {sorted(SUPPORTED_MINUTES)} 중 하나여야 합니다.")
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID 환경변수를 입력하세요."
-    )
+    raise RuntimeError("TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID 환경변수가 필요합니다.")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("upbit-scanner")
+log = logging.getLogger("upbit-turtle-scanner")
 
 
 @dataclass
@@ -56,7 +58,6 @@ class Candle:
     low: float
     close: float
     volume: float
-    trade_value: float
 
     @classmethod
     def from_rest(cls, item: dict[str, Any]) -> "Candle":
@@ -67,7 +68,6 @@ class Candle:
             low=float(item["low_price"]),
             close=float(item["trade_price"]),
             volume=float(item["candle_acc_trade_volume"]),
-            trade_value=float(item.get("candle_acc_trade_price", 0)),
         )
 
     @classmethod
@@ -79,8 +79,16 @@ class Candle:
             low=float(item["low_price"]),
             close=float(item["trade_price"]),
             volume=float(item["candle_acc_trade_volume"]),
-            trade_value=float(item.get("candle_acc_trade_price", 0)),
         )
+
+
+@dataclass
+class PositionState:
+    active: bool = False
+    buy_number: int = 0
+    last_buy_price: float = 0.0
+    unit_atr: float = 0.0
+    last_processed_start: datetime | None = None
 
 
 def parse_kst(value: str) -> datetime:
@@ -88,16 +96,21 @@ def parse_kst(value: str) -> datetime:
     return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
 
 
-def current_bucket_start(now: datetime | None = None) -> datetime:
-    now = now or datetime.now(KST)
-    total_minutes = now.hour * 60 + now.minute
-    bucket_minutes = (total_minutes // CANDLE_MINUTES) * CANDLE_MINUTES
-    return now.replace(
-        hour=bucket_minutes // 60,
-        minute=bucket_minutes % 60,
+def bucket_start(dt: datetime) -> datetime:
+    total = dt.hour * 60 + dt.minute
+    rounded = (total // CANDLE_MINUTES) * CANDLE_MINUTES
+    return dt.replace(
+        hour=rounded // 60,
+        minute=rounded % 60,
         second=0,
         microsecond=0,
     )
+
+
+def next_boundary(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(KST)
+    current = bucket_start(now)
+    return current + timedelta(minutes=CANDLE_MINUTES)
 
 
 def format_krw(price: float) -> str:
@@ -105,26 +118,42 @@ def format_krw(price: float) -> str:
         return f"₩{price:,.0f}"
     if price >= 1:
         return f"₩{price:,.2f}".rstrip("0").rstrip(".")
-    return f"₩{price:,.6f}".rstrip("0").rstrip(".")
+    return f"₩{price:,.8f}".rstrip("0").rstrip(".")
+
+
+def true_range(current: Candle, previous_close: float) -> float:
+    return max(
+        current.high - current.low,
+        abs(current.high - previous_close),
+        abs(current.low - previous_close),
+    )
+
+
+def calculate_atr(candles: list[Candle], length: int) -> float | None:
+    if len(candles) < length + 1:
+        return None
+    selected = candles[-(length + 1):]
+    values = [
+        true_range(selected[i], selected[i - 1].close)
+        for i in range(1, len(selected))
+    ]
+    return sum(values) / len(values) if values else None
 
 
 class Scanner:
     def __init__(self) -> None:
+        max_history = max(HISTORY_COUNT, BREAKOUT_LENGTH + ATR_LENGTH + 20)
         self.names: dict[str, str] = {}
         self.histories: dict[str, deque[Candle]] = defaultdict(
-            lambda: deque(maxlen=max(60, BREAKOUT_LENGTH + 10))
+            lambda: deque(maxlen=max_history)
         )
         self.current: dict[str, Candle] = {}
-        self.buy_active: dict[str, bool] = defaultdict(bool)
-        self.ready_sent_for_candle: set[tuple[str, datetime]] = set()
-        self.pending_ready: dict[str, tuple[float, float]] = {}
-        self.pending_buy1: dict[str, tuple[float, float]] = {}
-        self.last_report_bucket: datetime | None = None
-        self.report_task: asyncio.Task | None = None
-        self.stop_event = asyncio.Event()
+        self.states: dict[str, PositionState] = defaultdict(PositionState)
         self.http: aiohttp.ClientSession | None = None
+        self.stop_event = asyncio.Event()
+        self.process_lock = asyncio.Lock()
 
-    async def send_telegram(self, text: str) -> None:
+    async def telegram(self, text: str) -> None:
         assert self.http is not None
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -133,206 +162,172 @@ class Scanner:
             "disable_web_page_preview": True,
         }
         try:
-            async with self.http.post(url, json=payload, timeout=15) as response:
+            async with self.http.post(url, json=payload, timeout=20) as response:
                 body = await response.text()
                 if response.status != 200:
                     log.error("텔레그램 전송 실패 %s: %s", response.status, body)
         except Exception:
-            log.exception("텔레그램 전송 중 오류")
+            log.exception("텔레그램 전송 오류")
 
     async def fetch_markets(self) -> list[str]:
         assert self.http is not None
-        url = f"{UPBIT_REST}/market/all"
-        params = {"is_details": "true"}
-        async with self.http.get(url, params=params, timeout=20) as response:
+        async with self.http.get(
+            f"{UPBIT_REST}/market/all",
+            params={"is_details": "true"},
+            timeout=20,
+        ) as response:
             response.raise_for_status()
             items = await response.json()
 
-        markets = []
+        markets: list[str] = []
         for item in items:
             market = item["market"]
-            if not market.startswith("KRW-"):
-                continue
-            # 거래지원 주의 종목도 시세 감시는 가능하므로 기본 포함
-            markets.append(market)
-            self.names[market] = item.get("korean_name") or market.split("-", 1)[1]
+            if market.startswith("KRW-"):
+                markets.append(market)
+                self.names[market] = item.get("korean_name") or market.split("-", 1)[1]
+        return sorted(markets)
 
-        markets.sort()
-        return markets
-
-    async def fetch_history(self, market: str) -> None:
+    async def fetch_history(self, market: str) -> list[Candle]:
         assert self.http is not None
         url = f"{UPBIT_REST}/candles/minutes/{CANDLE_MINUTES}"
-        params = {"market": market, "count": max(30, BREAKOUT_LENGTH + 5)}
+        params = {"market": market, "count": min(HISTORY_COUNT, 200)}
 
-        for attempt in range(5):
+        for attempt in range(6):
             try:
-                async with self.http.get(url, params=params, timeout=20) as response:
+                async with self.http.get(url, params=params, timeout=25) as response:
                     if response.status == 429:
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     response.raise_for_status()
                     items = await response.json()
-                break
+                return [Candle.from_rest(x) for x in reversed(items)]
             except Exception:
-                if attempt == 4:
+                if attempt == 5:
                     raise
                 await asyncio.sleep(1.5 * (attempt + 1))
-        else:
-            return
+        return []
 
-        candles = [Candle.from_rest(item) for item in reversed(items)]
-        active_start = current_bucket_start()
+    def simulate_state(self, candles: list[Candle]) -> PositionState:
+        """재시작 후에도 최근 200봉을 재생해 BUY 번호 상태를 복원한다."""
+        state = PositionState()
+        processed: list[Candle] = []
 
-        # 현재 진행 중인 봉은 과거 완성봉 목록에서 제외
-        completed = [c for c in candles if c.start < active_start]
-        self.histories[market].extend(completed)
+        for candle in candles:
+            needed = max(BREAKOUT_LENGTH, EXIT_LENGTH, ATR_LENGTH + 1)
+            if len(processed) < needed:
+                processed.append(candle)
+                continue
 
-    async def initialize_histories(self, markets: list[str]) -> None:
-        total = len(markets)
+            previous_breakout_high = max(
+                c.high for c in processed[-BREAKOUT_LENGTH:]
+            )
+            previous_exit_low = min(c.low for c in processed[-EXIT_LENGTH:])
+            atr = calculate_atr(processed, ATR_LENGTH)
+
+            if atr is None or atr <= 0:
+                processed.append(candle)
+                continue
+
+            if not state.active:
+                if candle.close > previous_breakout_high:
+                    state.active = True
+                    state.buy_number = 1
+                    state.last_buy_price = candle.close
+                    state.unit_atr = atr
+            else:
+                if candle.close < previous_exit_low:
+                    state = PositionState()
+                else:
+                    step = state.unit_atr * ADD_ATR_MULTIPLIER
+                    if step > 0:
+                        while candle.close >= state.last_buy_price + step:
+                            state.buy_number += 1
+                            state.last_buy_price += step
+
+            state.last_processed_start = candle.start
+            processed.append(candle)
+
+        return state
+
+    async def initialize(self, markets: list[str]) -> None:
+        active_start = bucket_start(datetime.now(KST))
+
         for index, market in enumerate(markets, start=1):
             try:
-                await self.fetch_history(market)
+                candles = await self.fetch_history(market)
+                completed = [c for c in candles if c.start < active_start]
+                ongoing = [c for c in candles if c.start == active_start]
+
+                self.histories[market].extend(completed)
+                self.states[market] = self.simulate_state(completed)
+
+                if ongoing:
+                    self.current[market] = ongoing[-1]
             except Exception as error:
-                log.warning("%s 초기 캔들 조회 실패: %s", market, error)
+                log.warning("%s 초기화 실패: %s", market, error)
 
-            if index % 20 == 0 or index == total:
-                log.info("초기 캔들 준비 %s/%s", index, total)
-
-            # 공개 Candle REST 요청 제한을 넘지 않도록 간격 유지
+            if index % 20 == 0 or index == len(markets):
+                log.info("초기화 %s/%s", index, len(markets))
             await asyncio.sleep(REST_DELAY_SECONDS)
 
-    def previous_stats(self, market: str) -> tuple[float, float] | None:
+    def process_completed_candle(
+        self,
+        market: str,
+        candle: Candle,
+    ) -> list[tuple[int, float]]:
         history = self.histories[market]
-        if len(history) < BREAKOUT_LENGTH:
-            return None
+        state = self.states[market]
 
-        previous = list(history)[-BREAKOUT_LENGTH:]
-        breakout_high = max(c.high for c in previous)
-        average_volume = mean(c.volume for c in previous)
-        return breakout_high, average_volume
+        if state.last_processed_start and candle.start <= state.last_processed_start:
+            return []
 
-    async def check_ready(self, market: str, candle: Candle) -> None:
-        stats = self.previous_stats(market)
-        if stats is None:
-            return
+        needed = max(BREAKOUT_LENGTH, EXIT_LENGTH, ATR_LENGTH + 1)
+        if len(history) < needed:
+            history.append(candle)
+            state.last_processed_start = candle.start
+            return []
 
-        breakout_high, average_volume = stats
-        if breakout_high <= 0 or average_volume <= 0:
-            return
+        previous = list(history)
+        breakout_high = max(c.high for c in previous[-BREAKOUT_LENGTH:])
+        exit_low = min(c.low for c in previous[-EXIT_LENGTH:])
+        atr = calculate_atr(previous, ATR_LENGTH)
+        signals: list[tuple[int, float]] = []
 
-        # 아직 돌파 전이면서 최고가 1% 이내
-        distance = (breakout_high - candle.close) / breakout_high
-        if not (0 <= distance <= READY_DISTANCE):
-            return
+        if atr and atr > 0:
+            if not state.active:
+                if candle.close > breakout_high:
+                    state.active = True
+                    state.buy_number = 1
+                    state.last_buy_price = candle.close
+                    state.unit_atr = atr
+                    signals.append((1, candle.close))
+            else:
+                if candle.close < exit_low:
+                    # SELL 메시지는 보내지 않고 BUY 번호 상태만 초기화
+                    self.states[market] = PositionState(
+                        last_processed_start=candle.start
+                    )
+                    history.append(candle)
+                    return []
+                else:
+                    step = state.unit_atr * ADD_ATR_MULTIPLIER
+                    if step > 0:
+                        # 한 봉에서 여러 단계를 통과하면 BUY2, BUY3...를 모두 기록
+                        while candle.close >= state.last_buy_price + step:
+                            state.buy_number += 1
+                            state.last_buy_price += step
+                            signals.append((state.buy_number, candle.close))
 
-        now = datetime.now(KST)
-        elapsed = max(1.0, (now - candle.start).total_seconds())
-        full_seconds = CANDLE_MINUTES * 60
-        progress = min(1.0, elapsed / full_seconds)
+        state.last_processed_start = candle.start
+        history.append(candle)
+        return signals
 
-        # 진행률을 고려한 예상 거래량
-        projected_volume = candle.volume / max(progress, 0.10)
-        projected_ratio = projected_volume / average_volume
-
-        if projected_ratio < READY_VOLUME_RATIO:
-            return
-
-        key = (market, candle.start)
-        if key in self.ready_sent_for_candle:
-            return
-        self.ready_sent_for_candle.add(key)
-
-        # 메모리 증가 방지
-        if len(self.ready_sent_for_candle) > 3000:
-            cutoff = datetime.now(KST) - timedelta(days=2)
-            self.ready_sent_for_candle = {
-                item for item in self.ready_sent_for_candle if item[1] >= cutoff
-            }
-
-        symbol = market.split("-", 1)[1]
-        name = self.names.get(market, symbol)
-        self.pending_ready[market] = (candle.close, distance * 100)
-        log.info(
-            "READY 적재 %s distance=%.3f%% volume=%.2fx",
-            market,
-            distance * 100,
-            projected_ratio,
-        )
-
-    async def finalize_candle(self, market: str, candle: Candle) -> None:
-        stats = self.previous_stats(market)
-        if stats is None:
-            self.histories[market].append(candle)
-            return
-
-        breakout_high, average_volume = stats
-        history = self.histories[market]
-        previous_close = history[-1].close if history else 0
-        volume_ratio = candle.volume / average_volume if average_volume > 0 else 0
-
-        buy_condition = (
-            candle.close > breakout_high
-            and previous_close <= breakout_high
-            and volume_ratio >= BUY_VOLUME_RATIO
-        )
-
-        if buy_condition and not self.buy_active[market]:
-            self.buy_active[market] = True
-            symbol = market.split("-", 1)[1]
-            name = self.names.get(market, symbol)
-            self.pending_buy1[market] = (candle.close, volume_ratio)
-            self.pending_ready.pop(market, None)
-            log.info(
-                "BUY1 적재 %s close=%s volume=%.2fx",
-                market,
-                candle.close,
-                volume_ratio,
-            )
-        elif not buy_condition:
-            # 조건이 해제되면 다음 돌파를 다시 알릴 수 있게 재무장
-            self.buy_active[market] = False
-
-        self.histories[market].append(candle)
-
-    async def handle_message(self, item: dict[str, Any]) -> None:
-        if "error" in item:
-            raise RuntimeError(f"업비트 WebSocket 오류: {item['error']}")
-
-        if not str(item.get("type", "")).startswith("candle."):
-            return
-
-        market = item.get("code")
-        if not market:
-            return
-
-        incoming = Candle.from_ws(item)
-        previous = self.current.get(market)
-
-        if previous is None:
-            self.current[market] = incoming
-            await self.check_ready(market, incoming)
-            return
-
-        if incoming.start == previous.start:
-            self.current[market] = incoming
-            await self.check_ready(market, incoming)
-            return
-
-        if incoming.start > previous.start:
-            # 새 봉이 처음 도착한 순간 직전 봉을 완성봉으로 처리
-            await self.finalize_candle(market, previous)
-
-            # 전체 코인 중 첫 번째 새 봉이 확인되는 시점에 직전 구간 신호를 한 번에 전송
-            if self.last_report_bucket != incoming.start:
-                self.last_report_bucket = incoming.start
-                self.schedule_batched_report(incoming.start)
-
-            self.current[market] = incoming
-            await self.check_ready(market, incoming)
-
-    def build_report(self, report_time: datetime) -> str | None:
-        if not self.pending_buy1 and not self.pending_ready:
+    def build_report(
+        self,
+        report_time: datetime,
+        grouped: dict[int, list[tuple[str, float]]],
+    ) -> str | None:
+        if not grouped:
             return None
 
         lines = [
@@ -341,53 +336,71 @@ class Scanner:
             "",
         ]
 
-        if self.pending_buy1:
+        for buy_number in sorted(grouped):
             items = sorted(
-                self.pending_buy1.items(),
-                key=lambda item: item[1][1],
-                reverse=True,
+                grouped[buy_number],
+                key=lambda item: item[0],
             )
-            lines.append(f"🚨 BUY1 ({len(items)})")
-            for market, (price, _) in items:
+            lines.append(f"🚨 BUY{buy_number} ({len(items)})")
+            lines.append("")
+            for market, price in items:
                 symbol = market.split("-", 1)[1]
                 name = self.names.get(market, symbol)
-                lines.extend([f"{name} ({symbol})", format_krw(price), ""])
-
-        if self.pending_ready:
-            items = sorted(
-                self.pending_ready.items(),
-                key=lambda item: item[1][1],
-            )
-            lines.append(f"👀 준비 ({len(items)})")
-            for market, (price, _) in items:
-                symbol = market.split("-", 1)[1]
-                name = self.names.get(market, symbol)
-                lines.extend([f"{name} ({symbol})", format_krw(price), ""])
+                lines.append(f"{name} ({symbol})")
+                lines.append(format_krw(price))
+                lines.append("")
 
         return "\n".join(lines).rstrip()
 
-    async def send_batched_report(self, report_time: datetime) -> None:
-        # 새 봉 시작 직후 여러 코인의 마지막 봉이 순차적으로 도착하므로 잠시 모은다.
-        await asyncio.sleep(12)
+    async def finalize_interval(self, boundary: datetime) -> None:
+        async with self.process_lock:
+            target_start = boundary - timedelta(minutes=CANDLE_MINUTES)
+            grouped: dict[int, list[tuple[str, float]]] = defaultdict(list)
 
-        message = self.build_report(report_time)
-        if message:
-            await self.send_telegram(message)
-            log.info(
-                "종합 알림 전송 BUY1=%s READY=%s",
-                len(self.pending_buy1),
-                len(self.pending_ready),
-            )
+            for market, candle in list(self.current.items()):
+                if candle.start != target_start:
+                    continue
 
-        self.pending_buy1.clear()
-        self.pending_ready.clear()
+                signals = self.process_completed_candle(market, candle)
+                for buy_number, price in signals:
+                    grouped[buy_number].append((market, price))
 
-    def schedule_batched_report(self, report_time: datetime) -> None:
-        if self.report_task and not self.report_task.done():
+            report = self.build_report(boundary, grouped)
+            if report:
+                await self.telegram(report)
+                log.info(
+                    "종합 BUY 알림 전송: %s",
+                    {k: len(v) for k, v in grouped.items()},
+                )
+            else:
+                log.info("%s 마감: 신규 BUY 신호 없음", boundary.strftime("%H:%M"))
+
+    async def boundary_loop(self) -> None:
+        while not self.stop_event.is_set():
+            boundary = next_boundary()
+            run_at = boundary + timedelta(seconds=CLOSE_WAIT_SECONDS)
+            delay = max(0.0, (run_at - datetime.now(KST)).total_seconds())
+
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            await self.finalize_interval(boundary)
+
+    async def handle_ws(self, item: dict[str, Any]) -> None:
+        if "error" in item:
+            raise RuntimeError(f"업비트 WebSocket 오류: {item['error']}")
+        if not str(item.get("type", "")).startswith("candle."):
             return
-        self.report_task = asyncio.create_task(
-            self.send_batched_report(report_time)
-        )
+
+        market = item.get("code")
+        if not market:
+            return
+
+        candle = Candle.from_ws(item)
+        self.current[market] = candle
 
     async def websocket_loop(self, markets: list[str]) -> None:
         request = [
@@ -400,10 +413,9 @@ class Scanner:
             {"format": "DEFAULT"},
         ]
 
-        retry_seconds = 2
+        backoff = 2
         while not self.stop_event.is_set():
             try:
-                log.info("업비트 WebSocket 연결 중...")
                 async with websockets.connect(
                     UPBIT_WS,
                     ping_interval=30,
@@ -412,36 +424,50 @@ class Scanner:
                     max_size=None,
                 ) as websocket:
                     await websocket.send(json.dumps(request))
-                    log.info("WebSocket 연결 완료: KRW 마켓 %s개", len(markets))
-                    retry_seconds = 2
+                    log.info("WebSocket 연결 완료: %s개 마켓", len(markets))
+                    backoff = 2
 
                     async for raw in websocket:
                         if self.stop_event.is_set():
-                            break
+                            return
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
-                        item = json.loads(raw)
-                        await self.handle_message(item)
+                        await self.handle_ws(json.loads(raw))
 
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                log.warning("WebSocket 연결 오류: %s", error)
-                await asyncio.sleep(retry_seconds)
-                retry_seconds = min(retry_seconds * 2, 60)
+                log.warning("WebSocket 재연결 대기: %s", error)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def run(self) -> None:
         timeout = aiohttp.ClientTimeout(total=30)
-        headers = {"User-Agent": "upbit-realtime-scanner/1.0"}
+        headers = {"User-Agent": "upbit-turtle-scanner/2.0"}
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             self.http = session
             markets = await self.fetch_markets()
-            log.info("업비트 KRW 마켓 %s개 확인", len(markets))
+            log.info("KRW 마켓 %s개 확인", len(markets))
 
-            await self.initialize_histories(markets)
+            # 텔레그램 시작/초기화 메시지는 보내지 않는다.
+            await self.initialize(markets)
+            log.info("초기화 완료. BUY 신호만 종합 전송합니다.")
 
-            await self.websocket_loop(markets)
+            ws_task = asyncio.create_task(self.websocket_loop(markets))
+            boundary_task = asyncio.create_task(self.boundary_loop())
+
+            done, pending = await asyncio.wait(
+                {ws_task, boundary_task},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exception = task.exception()
+                if exception:
+                    raise exception
 
 
 async def main() -> None:
