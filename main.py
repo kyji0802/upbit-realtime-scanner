@@ -641,7 +641,7 @@ class UpbitBuyScanner:
             await self.initialize_market_data(markets)
 
             log.info(
-                "초기화 완료. BUY1~BUY%s 신호만 종합 전송합니다.",
+                "VERSION 3.0 | 초기화 완료. BUY1~BUY%s 신호만 종합 전송합니다.",
                 MAX_BUY_LEVEL,
             )
 
