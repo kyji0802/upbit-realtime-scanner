@@ -239,10 +239,10 @@ class Scanner:
                     state = PositionState()
                 else:
                     step = state.unit_atr * ADD_ATR_MULTIPLIER
-                    if step > 0:
-                        while candle.close >= state.last_buy_price + step:
-                            state.buy_number += 1
-                            state.last_buy_price += step
+                    if step > 0 and candle.close >= state.last_buy_price + step:
+                        # 한 개의 15분봉에서는 BUY 번호를 최대 1단계만 증가시킨다.
+                        state.buy_number += 1
+                        state.last_buy_price += step
 
             state.last_processed_start = candle.start
             processed.append(candle)
@@ -311,12 +311,11 @@ class Scanner:
                     return []
                 else:
                     step = state.unit_atr * ADD_ATR_MULTIPLIER
-                    if step > 0:
-                        # 한 봉에서 여러 단계를 통과하면 BUY2, BUY3...를 모두 기록
-                        while candle.close >= state.last_buy_price + step:
-                            state.buy_number += 1
-                            state.last_buy_price += step
-                            signals.append((state.buy_number, candle.close))
+                    if step > 0 and candle.close >= state.last_buy_price + step:
+                        # 한 개의 15분봉에서는 BUY 번호를 최대 1단계만 증가시킨다.
+                        state.buy_number += 1
+                        state.last_buy_price += step
+                        signals.append((state.buy_number, candle.close))
 
         state.last_processed_start = candle.start
         history.append(candle)
