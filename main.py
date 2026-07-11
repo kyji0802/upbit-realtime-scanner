@@ -30,6 +30,7 @@ BREAKOUT_LENGTH = int(os.getenv("BREAKOUT_LENGTH", "20"))
 EXIT_LENGTH = int(os.getenv("EXIT_LENGTH", "10"))
 ATR_LENGTH = int(os.getenv("ATR_LENGTH", "20"))
 ADD_ATR_MULTIPLIER = float(os.getenv("ADD_ATR_MULTIPLIER", "0.5"))
+MAX_BUY_LEVEL = int(os.getenv("MAX_BUY_LEVEL", "4"))
 HISTORY_COUNT = int(os.getenv("HISTORY_COUNT", "200"))
 REST_DELAY_SECONDS = float(os.getenv("REST_DELAY_SECONDS", "0.12"))
 CLOSE_WAIT_SECONDS = int(os.getenv("CLOSE_WAIT_SECONDS", "12"))
@@ -239,8 +240,12 @@ class Scanner:
                     state = PositionState()
                 else:
                     step = state.unit_atr * ADD_ATR_MULTIPLIER
-                    if step > 0 and candle.close >= state.last_buy_price + step:
-                        # 한 개의 15분봉에서는 BUY 번호를 최대 1단계만 증가시킨다.
+                    if (
+                        step > 0
+                        and state.buy_number < MAX_BUY_LEVEL
+                        and candle.close >= state.last_buy_price + step
+                    ):
+                        # 한 개의 15분봉에서는 최대 1단계만 증가하고 BUY4에서 멈춘다.
                         state.buy_number += 1
                         state.last_buy_price += step
 
@@ -311,8 +316,12 @@ class Scanner:
                     return []
                 else:
                     step = state.unit_atr * ADD_ATR_MULTIPLIER
-                    if step > 0 and candle.close >= state.last_buy_price + step:
-                        # 한 개의 15분봉에서는 BUY 번호를 최대 1단계만 증가시킨다.
+                    if (
+                        step > 0
+                        and state.buy_number < MAX_BUY_LEVEL
+                        and candle.close >= state.last_buy_price + step
+                    ):
+                        # 한 개의 15분봉에서는 최대 1단계만 증가하고 BUY4에서 멈춘다.
                         state.buy_number += 1
                         state.last_buy_price += step
                         signals.append((state.buy_number, candle.close))
@@ -335,7 +344,7 @@ class Scanner:
             "",
         ]
 
-        for buy_number in sorted(grouped):
+        for buy_number in sorted(n for n in grouped if 1 <= n <= MAX_BUY_LEVEL):
             items = sorted(
                 grouped[buy_number],
                 key=lambda item: item[0],
