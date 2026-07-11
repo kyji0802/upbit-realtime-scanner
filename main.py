@@ -117,6 +117,10 @@ class Scanner:
         self.current: dict[str, Candle] = {}
         self.buy_active: dict[str, bool] = defaultdict(bool)
         self.ready_sent_for_candle: set[tuple[str, datetime]] = set()
+        self.pending_ready: dict[str, tuple[float, float]] = {}
+        self.pending_buy1: dict[str, tuple[float, float]] = {}
+        self.last_report_bucket: datetime | None = None
+        self.report_task: asyncio.Task | None = None
         self.stop_event = asyncio.Event()
         self.http: aiohttp.ClientSession | None = None
 
@@ -248,16 +252,13 @@ class Scanner:
 
         symbol = market.split("-", 1)[1]
         name = self.names.get(market, symbol)
-        message = (
-            f"👀 실시간 준비\n\n"
-            f"{name} ({symbol})\n"
-            f"{format_krw(candle.close)}\n\n"
-            f"돌파까지: {distance * 100:.2f}%\n"
-            f"예상 거래량: 평균 대비 {projected_ratio:.2f}배\n"
-            f"기준: {CANDLE_MINUTES}분봉"
+        self.pending_ready[market] = (candle.close, distance * 100)
+        log.info(
+            "READY 적재 %s distance=%.3f%% volume=%.2fx",
+            market,
+            distance * 100,
+            projected_ratio,
         )
-        await self.send_telegram(message)
-        log.info("READY %s distance=%.3f%% volume=%.2fx", market, distance * 100, projected_ratio)
 
     async def finalize_candle(self, market: str, candle: Candle) -> None:
         stats = self.previous_stats(market)
@@ -280,17 +281,14 @@ class Scanner:
             self.buy_active[market] = True
             symbol = market.split("-", 1)[1]
             name = self.names.get(market, symbol)
-            message = (
-                f"🚨 BUY1 확정\n\n"
-                f"{name} ({symbol})\n"
-                f"{format_krw(candle.close)}\n\n"
-                f"{BREAKOUT_LENGTH}봉 최고가 돌파\n"
-                f"거래량: 평균 대비 {volume_ratio:.2f}배\n"
-                f"{CANDLE_MINUTES}분봉 마감 확정\n"
-                f"{candle.start:%Y-%m-%d %H:%M} KST"
+            self.pending_buy1[market] = (candle.close, volume_ratio)
+            self.pending_ready.pop(market, None)
+            log.info(
+                "BUY1 적재 %s close=%s volume=%.2fx",
+                market,
+                candle.close,
+                volume_ratio,
             )
-            await self.send_telegram(message)
-            log.info("BUY1 %s close=%s volume=%.2fx", market, candle.close, volume_ratio)
         elif not buy_condition:
             # 조건이 해제되면 다음 돌파를 다시 알릴 수 있게 재무장
             self.buy_active[market] = False
@@ -324,8 +322,72 @@ class Scanner:
         if incoming.start > previous.start:
             # 새 봉이 처음 도착한 순간 직전 봉을 완성봉으로 처리
             await self.finalize_candle(market, previous)
+
+            # 전체 코인 중 첫 번째 새 봉이 확인되는 시점에 직전 구간 신호를 한 번에 전송
+            if self.last_report_bucket != incoming.start:
+                self.last_report_bucket = incoming.start
+                self.schedule_batched_report(incoming.start)
+
             self.current[market] = incoming
             await self.check_ready(market, incoming)
+
+    def build_report(self, report_time: datetime) -> str | None:
+        if not self.pending_buy1 and not self.pending_ready:
+            return None
+
+        lines = [
+            "🪙 업비트 실시간 코인 스캐너",
+            report_time.strftime("%Y-%m-%d %H:%M"),
+            "",
+        ]
+
+        if self.pending_buy1:
+            items = sorted(
+                self.pending_buy1.items(),
+                key=lambda item: item[1][1],
+                reverse=True,
+            )
+            lines.append(f"🚨 BUY1 ({len(items)})")
+            for market, (price, _) in items:
+                symbol = market.split("-", 1)[1]
+                name = self.names.get(market, symbol)
+                lines.extend([f"{name} ({symbol})", format_krw(price), ""])
+
+        if self.pending_ready:
+            items = sorted(
+                self.pending_ready.items(),
+                key=lambda item: item[1][1],
+            )
+            lines.append(f"👀 준비 ({len(items)})")
+            for market, (price, _) in items:
+                symbol = market.split("-", 1)[1]
+                name = self.names.get(market, symbol)
+                lines.extend([f"{name} ({symbol})", format_krw(price), ""])
+
+        return "\n".join(lines).rstrip()
+
+    async def send_batched_report(self, report_time: datetime) -> None:
+        # 새 봉 시작 직후 여러 코인의 마지막 봉이 순차적으로 도착하므로 잠시 모은다.
+        await asyncio.sleep(12)
+
+        message = self.build_report(report_time)
+        if message:
+            await self.send_telegram(message)
+            log.info(
+                "종합 알림 전송 BUY1=%s READY=%s",
+                len(self.pending_buy1),
+                len(self.pending_ready),
+            )
+
+        self.pending_buy1.clear()
+        self.pending_ready.clear()
+
+    def schedule_batched_report(self, report_time: datetime) -> None:
+        if self.report_task and not self.report_task.done():
+            return
+        self.report_task = asyncio.create_task(
+            self.send_batched_report(report_time)
+        )
 
     async def websocket_loop(self, markets: list[str]) -> None:
         request = [
@@ -377,22 +439,7 @@ class Scanner:
             markets = await self.fetch_markets()
             log.info("업비트 KRW 마켓 %s개 확인", len(markets))
 
-            await self.send_telegram(
-                "🟡 코인 스캐너 초기화 중\n\n"
-                f"감시 대상: 업비트 KRW {len(markets)}개\n"
-                f"기준 봉: {CANDLE_MINUTES}분봉\n"
-                "과거 캔들을 불러오는 중입니다."
-            )
-
             await self.initialize_histories(markets)
-
-            await self.send_telegram(
-                "🟢 업비트 실시간 코인 스캐너 시작\n\n"
-                f"감시 대상: KRW 마켓 {len(markets)}개\n"
-                f"기준 봉: {CANDLE_MINUTES}분봉\n"
-                f"준비: {BREAKOUT_LENGTH}봉 최고가 {READY_DISTANCE * 100:.1f}% 이내\n"
-                f"BUY1: 최고가 돌파 + 거래량 {BUY_VOLUME_RATIO:.1f}배"
-            )
 
             await self.websocket_loop(markets)
 
